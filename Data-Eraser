@@ -1,0 +1,151 @@
+# CLAUDE.md — Data Eraser
+
+> Bu dosya Claude Code için proje bağlamıdır. Kod yazmadan önce mimari kararlara,
+> "Yasal ve Etik Sınırlar"a ve "Kritik Dikkat Noktaları"na uy. Bu proje meşru bir
+> kategoridir (DeleteMe / Incogni / Mozilla Monitor benzeri) ama üç gerçek
+> hassasiyet ekseni var: **kullanıcının kendi verisinin korunması**, **bot/anti-bot
+> yasal sınırı** ve **kötüye kullanım önleme**.
+
+## Proje Özeti
+
+Data Eraser, kullanıcının dijital ayak izini veri simsarlarına (data brokers) ve
+izinsiz rehber sitelerine karşı savunan otonom bir gizlilik asistanıdır:
+internette **kullanıcının kendi** verilerinin sızdığı noktaları tarar, KVKK/GDPR/
+CCPA'ya dayanan "verimi sil" (opt-out / unutulma hakkı) taleplerini otomatikleştirir
+ve süreçleri takip eder.
+
+**Tek cümlede değer:** "Kendi verini internetten sildirme sürecini otomatikleştir."
+
+## Teknoloji Yığını
+
+> **CLAUDE önerisi: tek dil — Python uçtan uca.** Otomasyon motoru zaten Python
+> olacağı için backend'i de Python yapmak (FastAPI + Celery) Node+Python bölünmesini
+> ortadan kaldırır; modeller, kuyruk ve scraping tek ekosistemde.
+
+- **Tarama/otomasyon:** **Playwright** *(Selenium'a tercih — daha stabil, modern
+  anti-bot'a daha dayanıklı, async)*. Geniş tarama için Scrapy.
+- **Backend API:** **FastAPI** *(NestJS alternatifti; Python birliği için FastAPI)*.
+- **Görev kuyruğu:** **Celery** + Redis/RabbitMQ broker *(BullMQ alternatif — ama
+  Python tarafında Celery doğal)*. Taramalar uzun sürer → her şey asenkron.
+- **Veritabanı:** PostgreSQL — PII alanları **field-level şifreli** (app katmanında
+  AES-256-GCM veya pgcrypto, anahtar yönetimi KMS ile). "Encryption at rest"
+  beklentisini bununla karşıla. (Aşağıdaki #1 gotcha'yı mutlaka oku.)
+- **E-posta:** SendGrid / Mailgun (SPF/DKIM/DMARC şart — #5).
+- **Frontend:** Next.js dashboard — durum/risk skoru net, güven veren kurumsal arayüz.
+
+## Repo Yapısı (hedeflenen)
+
+```
+data-eraser/
+├── CLAUDE.md
+├── api/                    # FastAPI
+│   └── app/
+│       ├── auth/
+│       ├── identities/     # kullanıcının izlenecek PII'ı (şifreli)
+│       ├── brokers/        # broker kataloğu + opt-out yöntemi
+│       ├── exposures/      # bulunan sızıntılar
+│       └── requests/       # opt-out talep durum makinesi
+├── worker/                 # Celery
+│   ├── scanners/           # arama/tarama görevleri
+│   ├── connectors/         # broker BAŞINA opt-out adaptörü (kırılgan! → #7)
+│   └── mailer/             # talep + takip e-postaları
+└── web/                    # Next.js dashboard
+```
+
+## Veritabanı Şeması (özet)
+
+```sql
+CREATE TABLE users (
+  id UUID PRIMARY KEY, email TEXT UNIQUE, created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Kullanıcının izlenmesini istediği KENDİ verisi — şifreli + SAHİPLİK doğrulanmış
+CREATE TABLE identities (
+  id UUID PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  type TEXT,                       -- name | email | phone | address
+  value_encrypted BYTEA NOT NULL,  -- AES-256-GCM (plaintext ASLA saklanmaz/loglanmaz)
+  ownership_verified BOOLEAN DEFAULT FALSE,  -- bkz. #6 kötüye kullanım önleme
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE brokers (
+  id UUID PRIMARY KEY, name TEXT, domain TEXT,
+  optout_method TEXT,              -- email | form | api | manual
+  optout_target TEXT,              -- e-posta adresi / form URL
+  jurisdiction TEXT                -- KVKK | GDPR | CCPA
+);
+
+CREATE TABLE exposures (           -- bulunan sızıntı
+  id UUID PRIMARY KEY, user_id UUID, broker_id UUID REFERENCES brokers(id),
+  url TEXT, found_at TIMESTAMPTZ DEFAULT now(),
+  status TEXT DEFAULT 'detected'   -- detected | requested | awaiting | completed | escalated | failed
+);
+
+CREATE TABLE requests (            -- opt-out talebi (idempotent → #4)
+  id UUID PRIMARY KEY, exposure_id UUID REFERENCES exposures(id) ON DELETE CASCADE,
+  method TEXT, sent_at TIMESTAMPTZ, deadline_at TIMESTAMPTZ,  -- KVKK: ~30 gün
+  status TEXT, response_summary TEXT,
+  UNIQUE (exposure_id)             -- aynı sızıntıya tekrar tekrar talep gönderme
+);
+```
+
+## Yasal ve Etik Sınırlar (bu projede pazarlanabilirlikten önce gelir)
+
+- **Yalnızca kullanıcının KENDİ verisi.** Ürün, başkasının verisini sildirme/
+  de-indeksleme aracına dönüşmemeli — aksi halde taciz/sansür için kötüye kullanılır.
+  Bu yüzden `ownership_verified` zorunlu (örn. taranacak e-postaya doğrulama linki).
+- **Captcha/anti-bot'u "aşmak" bir ürün özelliği DEĞİL.** Anti-bot savunmalarını
+  kırmak hedef sitenin ToS'unu ihlal edebilir ve bazı yargı alanlarında bilişim
+  suçu/anti-circumvention kapsamına girebilir. **Compliant tasarım:** önce resmi
+  opt-out formu/API ve **e-posta tabanlı yasal talep** (KVKK/GDPR/CCPA hepsi
+  veri sorumlusuna/DPO'ya e-posta ile talebe izin verir); site anti-bot çıkarırsa
+  **insan-döngüde (human-in-the-loop)** kuyruğa al, otomatik kırma deneme. İtibarlı
+  servisler de pratikte böyle yapar.
+- **Otomatik "ihtar/tehdit" mektubu yerine yasal hak + gerçek mercie eskalasyon.**
+  Giden iletişim, tehdit dili değil, kullanıcının **kanuni hakkını kullanması**
+  olmalı (KVKK m.7 silme / GDPR m.17 unutulma hakkı), net süre belirterek. Yanıt
+  yoksa eskalasyon = **gerçek otoriteye şikâyet** (TR'de Kişisel Verileri Koruma
+  Kurumu'na başvuru), muğlak "tehdit" değil. Şablonlar olgusal ve tercihen kullanıcı
+  onaylı olmalı.
+- **Scraping nezaketi:** robots/ToS'a saygı, rate-limit, login/paywall arkasını
+  tarama yok. Öncelik kamuya açık arama + bilinen broker opt-out dizinleri.
+
+## Kritik Dikkat Noktaları (gotchas)
+
+1. **"Zero-knowledge" iddiası teknik olarak ÇELİŞKİLİ — dürüst ol.** Sistem
+   kullanıcı adına tarama yapıp form dolduracağı için işlem anında **plaintext PII'a
+   ihtiyaç duyar**; dolayısıyla sunucunun veriyi hiç göremediği gerçek bir
+   zero-knowledge mümkün değil. Gerçekçi duruş: *field-level şifreleme + en az
+   yetki + KMS anahtarları + plaintext'i yalnızca worker'da işlem anında çöz +
+   asla loglama + kısa saklama*. Pazarlamada "zero-knowledge" deme; "şifreli ve
+   en-az-yetkili" de.
+2. **Plaintext sızıntısı yüzeyleri.** Loglar, hata mesajları, kuyruk payload'ları,
+   APM izleri PII sızdırabilir. Celery task payload'larında ham PII taşıma —
+   `identity_id` taşı, değeri worker içinde çöz.
+3. **Connector kırılganlığı.** Her broker ayrı bir adaptör; site HTML/form
+   değişince kırılır. Adaptörleri izole, versiyonlu ve "kırıldı" alarmlı yap; bunu
+   sürekli bakım gerektiren bir maliyet olarak planla.
+4. **Idempotency / spam etmeme.** Aynı sızıntıya tekrar tekrar talep gönderme
+   (hem yasal hem itibar açısından kötü). `requests.UNIQUE(exposure_id)` + durum
+   makinesi: detected → requested → awaiting(deadline) → completed | escalated | failed.
+5. **E-posta teslimi & blocklist.** Tek domainden çok sayıda otomatik opt-out
+   e-postası → spam/blacklist. SPF/DKIM/DMARC doğru kur, yanıtları işle, `Reply-To`'yu
+   kullanıcı adına yetki diliyle ayarla, gönderim hacmini ısıt.
+6. **Kötüye kullanım önleme (yeniden — çünkü kritik).** Talep tetiklenmeden önce
+   ilgili `identity` için `ownership_verified = true` şart. Aksi halde araç
+   başkasının içeriğini kaldırtmak için silah olur.
+7. **Uzun/kırılgan işler.** Taramalar uzun ve hatalı sonlanabilir → Celery retry,
+   kısmi başarı, site-bazlı timeout. Tarama durumu dashboard'a gerçek zamanlı değil,
+   periyodik özetlenerek yansısın.
+
+## Yol Haritası (önerilen MVP sırası)
+
+1. **Kimlik + sahiplik doğrulama:** kullanıcı PII ekler, e-posta sahipliği doğrulanır,
+   field-level şifreleme devrede.
+2. **Tarama motoru (read-only):** birkaç bilinen broker/arama kaynağı için scanner,
+   `exposures` üretimi. Henüz talep göndermez.
+3. **Opt-out (e-posta-öncelikli):** KVKK/GDPR şablonlu e-posta talepleri, durum
+   makinesi, deadline takibi. Form/connector'lar sonra, kırılan yerde human-in-the-loop.
+4. **Dashboard + risk skoru:** bekleyen/tamamlanan talepler, temizlenme oranı.
+5. **Eskalasyon:** süre aşımında otomatik hatırlatma + gerçek otoriteye şikâyet akışı
+   (TR: KVKK Kurumu).
